@@ -1,0 +1,419 @@
+---
+title: "4_analyse_data"
+format: html
+editor: visual
+---
+
+## Load data
+
+Data:
+
+```{r}
+dat <- fread("data/prepped_steps.csv", data.table = FALSE) # this file location assumes running in same session as previous script
+```
+
+## Additional data preprocessing
+
+Done in this script not the previous to ensure reference values behave (easy to fix by relevelling otherwise).
+
+```{r}
+dat$step_fifths <- qtile_cut(dat$med_steps, probs = seq(0, 1, by = 0.2))
+dat$acc_fifths <- qtile_cut(dat$overall_activity, probs = seq(0, 1, by = 0.2), dp_label = 1)
+dat$tdi_quarters <- qtile_cut(dat$tdi_raw, probs = seq(0, 1, by = 0.25), dp_label = 1)
+dat$age_gp_crude <- cut(dat$age_entry_years, seq(40, 80, by = 10), right = FALSE, labels = c("40-49", "50-59", "60-69", "70-79"))
+dat$BMI_cats <-
+  cut(dat$BMI,
+      breaks = c(0, 18.5, 25, 30, 10000),
+      labels = c("<18.5", "18.5-24.9", "25.0-29.9", "30.0+"),
+      right = FALSE)
+```
+
+## Table
+
+```{r}
+# MAKE SURE FACTORS NEATLY ORGANISED ================================================
+dat$smoking <-
+  factor(dat$smoking,
+         levels = c("Never", "Previous", "Current"),
+         ordered = TRUE)
+dat$qualif <-
+  factor(
+    dat$qualif,
+    ordered = TRUE,
+    levels = c("School leaver", "Further education", "Higher education")
+  )
+dat$sr_usual_walking_pace <-
+  factor(
+    dat$sr_usual_walking_pace,
+    ordered = TRUE,
+    levels = c(
+      "Brisk pace",
+      "Steady average pace",
+      "Slow pace" ,
+      "None of the above",
+      "Missing"
+    )
+  )
+
+dat$sr_usual_walking_pace <-
+  factor(
+    dat$sr_usual_walking_pace,
+    ordered = TRUE,
+    levels = c(
+      "Brisk pace",
+      "Steady average pace",
+      "Slow pace" ,
+      "None of the above",
+      "Missing"
+    )
+  )
+
+dat$sr_overall_health <-
+  factor(
+    dat$sr_overall_health,
+    ordered = TRUE,
+    levels = c("Excellent self-rated overall health", "Good self-rated overall health", "Fair self-rated overall health", "Poor self-rated overall health", "Missing")
+  )
+
+dat$season_wear <-
+  factor(
+    dat$season_wear,
+    ordered = TRUE,
+    levels = c("Spring", "Summer", "Autumn", "Winter")
+  )
+
+# Set cadence to zero if NA
+
+dat$mean_one_minute_cadence[is.na(dat$mean_one_minute_cadence)] <- 0
+
+# FUNCTIONS FOR EXTRACTING NUMBERS======================================================
+source("useful_functions/format_for_table.R")
+
+# TABLE 1======================================================
+## FIRST ROW
+table1 <-
+  cbind(data.frame(
+    "Characteristic" = c("Overall"),
+    "Group" = c(" ")), get_table_numbers(dat, dat)
+  )
+
+## LIST AND ITERATE THROUGH VARIABLES 
+varlist <-
+  list(
+    "Sex" = "sex",
+    "Age (years)" = "age_gp_crude",
+    "Ethnicity" = "ethnicity",
+    "Quarter of Townsend Deprivation Index" = "tdi_quarters",
+    "Educational Qualifications" = "qualif",
+    "Smoking Status" = "smoking",
+    "Alcohol Consumption" = "alcohol",
+    "BMI (kg/m2)" = "BMI_cats",
+    "Self-Reported Usual Walking Pace" = "sr_usual_walking_pace",
+    "Self-Rated Overall Health" = "sr_overall_health",
+    "Wear Season" = "season_wear"
+  )
+
+for (name in names(varlist)) {
+  print(name)
+ 
+  variable <- varlist[[name]]
+  dat[, variable] <- factor(dat[, variable]) # ensure factors
+  factor_levels <- levels(dat[, variable])
+  
+  for (level in factor_levels) {
+    # GET LOCAL DATASET
+    dat_loc <- dat[dat[, variable] == level, ]
+    
+    # FILL OUT VARS FOR DATA FRAME
+    char <-
+      ifelse(level == factor_levels[1], name, "") # assign characteristic name only for first
+    table1_numbers <- get_table_numbers(dat_loc, dat)
+    
+    # MAKE INTO TABLE
+    table1_row <- cbind(
+      data.frame(
+        "Characteristic" = char,
+        "Group" = level), table1_numbers
+       
+      )
+    table1 <- rbind(table1, table1_row)
+    
+    
+    # TIDY
+    rm(char,
+       dat_loc,
+       table1_numbers,
+       table1_row)
+  }
+  # TIDY
+  rm(factor_levels, variable)
+  
+}
+
+write.csv(table1, paste0("outputs/table1_rw_", Sys.Date(), ".csv"), row.names = FALSE)
+```
+
+## Modelling
+
+Set up record for models:
+
+```{r}
+exposures <- c("step_cats", "step_fifths", "acc_fifths")
+outcomes <- c("ind_death", "ind_cv_death")
+
+multivar_covs <-
+c(
+"ethnicity",
+"tdi_quarters",
+"qualif",
+"smoking",
+"alcohol",
+"processed_meat",
+"fresh_fruit",
+"oily_fish",
+"added_salt"
+)
+
+adjustments <-
+list(
+"model1" = NULL,
+"model2" = c("sex"),
+"model3" = c("sex", "BMI_cats"),
+"model4" = c("sex", "BMI_cats", multivar_covs),
+"model5" = c("sex", "BMI_cats", multivar_covs, "cci"),
+"model6" = c("sex", "BMI_cats", multivar_covs, "cci", "age_gp_crude"), # this is just a crude check that adjustment for age using age as timescale has worked
+"model7" = c("sex", multivar_covs)
+)
+
+```
+
+```{r}
+for (factor in c("sex", "BMI_cats", multivar_covs, exposures)){
+  dat[, factor] <- factor(dat[, factor], ordered = FALSE)
+} # note all are factors so this works
+
+```
+
+We're not using all these different adjustment sets, but have left them in for the record.
+
+Cycle through:
+
+```{r}
+for (exposure in exposures) {
+  # SET UP RECORDING FRAME ======================================================
+  results_columns <-   c("Exposure",
+                         "Outcome",
+                         "Model",
+                         "Adjustment",
+                         "n",
+                         "n_event",
+                         as.vector(outer(
+                           # excessively complex code to get crossed column names
+                           c(
+                             "HR",
+                             "Lower_CI",
+                             "Upper_CI",
+                             "floatedlnHR",
+                             "floatedSE",
+                             "floatedHR",
+                             "floatedLower_CI",
+                             "floatedUpper_CI",
+                             "n",
+                             "n_event", 
+                             "mean_steps", 
+                             "mean_acc"
+                           ),
+                           unique(dat[, exposure]),
+                           paste,
+                           sep = "_"
+                         )))
+  results_tab <-
+    data.frame(matrix(ncol = length(results_columns) ,
+                      nrow = 0))
+  colnames(results_tab) <- results_columns
+  
+  # Do modelling: ===============================================================
+  for (i in 1:length(outcomes)) {
+    for (j in 1:length(adjustments)) {
+      # Pull relevant values-----------------------------
+      outcome <- outcomes[i]
+      model_name <- names(adjustments)[j]
+      covs <- adjustments[[j]]
+      
+      # Organise for model calculation-------------------
+      cov_sum <- paste0(c(exposure, covs), collapse = "+")
+      
+      # Model--------------------------------------------
+      form <-
+        paste0("Surv(age_entry_days, age_exit_days, ",
+               outcome,
+               ") ~ ",
+               cov_sum)
+      model <-
+        coxph(as.formula(form), dat)
+      print(cox.zph(model))
+      
+      # Extract values-----------------------------------
+      results_frame <-
+        data.frame(
+          "Exposure" = exposure,
+          "Outcome" = outcome,
+          "Model" = model_name,
+          "Adjustment" = paste0(covs, collapse = ","),
+          "n" = model$n,
+          "n_event" = model$nevent
+        )
+      
+      # CYCLE THROUGH EXPOSURE LEVELS EXTRACTING INFO=============================================
+      fac_levels <- levels(factor(dat[, exposure]))
+      for (cat in fac_levels) {
+        
+        # HRs=====================================================================================
+        if (cat == fac_levels[1]) {
+          HRs <- data.frame(matrix(c(1, 1, 1), nrow = 1))
+        }
+        else {
+          HRs <-
+            summary(model)$conf.int[paste0(exposure, cat), c("exp(coef)", "lower .95", "upper .95"), drop = FALSE]
+          rownames(HRs) <- NULL
+        }
+        colnames(HRs) <-
+          as.vector(outer(c("HR", "Lower_CI", "Upper_CI"), cat, paste, sep = "_"))
+        
+        # FLOATED HRs etc =======================================================================
+        float_model <- float(model)# This is doing floating absolute risks using Epi package
+        
+        ## Values
+        zval <- qnorm(0.975)
+        se <- sqrt(float_model$var[cat])
+        lnhr <- float_model$coef[cat]
+        
+        # Collate into frame
+        HRs_floated <-
+          data.frame(matrix(c(
+            lnhr,
+            se,
+            exp(lnhr),
+            exp(lnhr - se[cat] * zval),
+            exp(lnhr + se[cat] * zval)
+          ), nrow = 1))
+        colnames(HRs_floated) <-
+          as.vector(outer(
+            c(
+              "floatedlnHR",
+              "floatedSE",
+              "floatedHR",
+              "floatedLower_CI",
+              "floatedUpper_CI"
+            ),
+            cat,
+            paste,
+            sep = "_"
+          ))
+    
+        # n and nevent ===================================================================================
+        n_group <- nrow(dat[dat[, exposure] == cat, ])
+        n_event_group <- nrow(dat[(dat[, exposure] == cat) & (dat[, outcome]), ])
+        n_by_group <- data.frame(matrix(c(n_group, n_event_group), nrow = 1))
+        colnames(n_by_group) <-
+          as.vector(outer(c("n", "n_event"), cat, paste, sep = "_"))
+        
+        # Mean exposure ==================================================================================
+        col_me <- paste0("mean_steps_", cat)
+        col_acc <- paste0("mean_acc_", cat)
+        mean_exposure <- data.frame(mean(dat$med_steps[dat[, exposure] == cat]), 
+                                    mean(dat$overall_activity[dat[, exposure] == cat]))
+        colnames(mean_exposure) <- c(col_me, col_acc)
+        
+        # Bind together in final data frame ==============================================================
+        results_frame <-
+          cbind(results_frame, HRs, HRs_floated, n_by_group, mean_exposure)
+      }
+      
+      
+      # CHECK THAT n and n events match by different routes
+      nsum <- sum(results_frame[,  as.vector(outer(c("n"), fac_levels, paste, sep = "_"))])
+      n_eventsum <- sum(results_frame[,  as.vector(outer(c("n_event"), fac_levels, paste, sep = "_"))])
+      if ((results_frame$n != nsum)|(results_frame$n_event != n_eventsum)){
+        stop("Mismatch between numbers derived from different sources. Recheck model. May be that some rows are being excluded due to missing covariate data.")
+      }
+      
+      
+      # BIND INTO FINAL RESULTS FRAME AND DELETE
+      results_tab <- rbind(results_tab, results_frame)
+      
+      rm(results_frame)
+      
+    }
+  }
+  
+  assign(paste0(exposure, "_results_tab"), results_tab)
+  write.csv(results_tab, paste0("outputs/", exposure, "_tab.csv"))
+  # print(results_tab)
+  rm(results_tab, results_columns)
+}
+```
+
+## Estimated marginal means analyses
+
+There is an issue with excessively large reference grid, when adjusting for all variables, meaning you tend to crash it with the full set. In which case, rather than an ad hoc covariate set, this code uses a minimally adjusted (i.e. just age and sex).
+
+```{r}
+source("useful_functions/load_disease_codelist.R")
+disease_names <- paste0("prev_hes_", names(disease_codelist))
+# emm_options(rg.limit = 2000000) # if include many covariates uncomment as needs bigger grid
+rec_dat <- data.frame("Quality" = c(), "Mean" = c(), "LowerCI" = c(), "UpperCI" = c())
+for (exposure in c("sr_overall_health", disease_names)){
+  # Set up model
+  form <- as.formula(paste0(c("med_steps ~ age_entry_days", "sex", exposure), collapse = "+"))
+  model <- lm(form, data = dat)
+  emmeans_model <- emmeans(model, specs = exposure)
+  
+  # Fill out data frame
+  rec_dat_rows <- summary(emmeans_model)[,c(exposure, "emmean", "lower.CL", "upper.CL")]
+  colnames(rec_dat_rows) <- c("Quality", "Mean","LowerCI", "UpperCI")
+  
+  # Do by binding - not ideal as slower than pre-assigning data frame but needed here for flexibility
+  rec_dat <- rbind(rec_dat, rec_dat_rows)
+  
+  # Assign and tidy
+  assign(paste0(exposure, "_model"), model)
+  assign(paste0("emmeans_", exposure, "_model"), emmeans_model)
+  rm(form, model, emmeans_model, rec_dat_rows)
+}
+
+rec_dat
+
+```
+
+```{r}
+# Format rownames
+rec_dat$Quality <- sub("prev_hes_", "", rec_dat$Quality)
+rec_dat$Quality <- gsub("_", " ", rec_dat$Quality)
+write.csv(rec_dat, "outputs/forest_plot_tab.csv")
+```
+
+## Additional analysis (Scott)
+
+```{r}
+cor.test(dat$overall_activity, dat$med_steps, method = "spearman", conf.level = 0.95) # Correlation between Steps and Acceleration
+
+#Self reported health
+health_model <- aov(data = dat, med_steps ~ sr_overall_health)
+TukeyHSD(health_model)
+plot(TukeyHSD(health_model))
+
+#Self reported walking pace
+dat_no_sr_usual_walking_pace <- dat[!(dat$sr_usual_walking_pace == "Missing"), ] # Note this should not be in people missing this data
+pace_model <- aov(data = dat_no_sr_usual_walking_pace, mean_one_minute_cadence ~ sr_usual_walking_pace)
+TukeyHSD(pace_model)
+plot(TukeyHSD(pace_model))
+```
+
+# Clear up some of the mess ahead of running future scripts
+
+Not strictly necessary but hopefully avoids me accidentally relying on stuff in later scripts.
+
+```{r}
+rm(list = setdiff(ls(), lsf.str())) # this setdiff is listing everything then listing only functions. So it's saying remove everything that's not a function (see https://stackoverflow.com/questions/8305754/remove-all-variables-except-functions) 
+```

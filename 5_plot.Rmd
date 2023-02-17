@@ -1,0 +1,489 @@
+---
+title: "plot_data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Shape plot 
+
+Reread data: 
+```{r}
+dat <- fread("data/prepped_steps.csv", data.table = FALSE)
+dat$tdi_quarters <- qtile_cut(dat$tdi_raw, probs = seq(0, 1, by = 0.25), dp_label = 1)
+dat$BMI_cats <-
+  cut(dat$BMI,
+      breaks = c(0, 18.5, 25, 30, 10000),
+      labels = c("<18.5", "18.5-24.9", "25.0-29.9", "30.0+"),
+      right = FALSE)
+dat$age_gp_crude <- cut(dat$age_entry_years, seq(40, 80, by = 10), right = FALSE, labels = c("40-49", "50-59", "60-69", "70-79"))
+```
+
+Results:
+```{r}
+step_fifths_results_tab <- fread("outputs/step_fifths_tab.csv", data.table = FALSE) 
+```
+
+Organise results to plot and iteratively produce shape plots with different settings: 
+```{r}
+exposures <- c("step_fifths")
+outcomes <- c("ind_death",
+              "ind_cv_death")
+
+adjustments <- unique(step_fifths_results_tab$Adjustment)
+
+# CYCLE OVER ADJUSTMENTS=========================================
+ for (adjustment in adjustments) {
+   
+  # CYCLE OVER OUTCOMES ============================
+  for (outcome in outcomes) {
+      
+      # PROCESS OUTCOME NAME ======================================
+      if (outcome == "ind_death") {
+        outcome_title <- "All-Cause Mortality"
+      }  else if (outcome == "ind_cv_death") {
+        outcome_title <- "Cardiovascular Mortality"
+      }  else {
+        print(outcome)
+        stop("Unrecognised outcome value")
+      }
+      
+   
+  # CYCLE OVER EXPOSURES =================================================
+  for (exposure in exposures) {
+    print(exposure)
+      
+  # PROCESS EXPOSURE NAME ==========================================
+  if (exposure == "step_fifths") {
+    exposure_title <- "Median Daily Steps"
+  }
+  else if (exposure == "acc_fifths") {
+    exposure_title <- "Overall Acceleration (mg)"
+  }
+  else {
+    stop("Unrecognised exposure value")
+  }
+  
+  # GET RELEVANT DATASET =================================================
+  tab <- get(paste0(exposure, "_results_tab"))
+  
+  
+  
+      # EXTRACT RELEVANT ELEMENTS OF DATASET=============================
+      rel_tab <- tab[(tab$Outcome == outcome) & (tab$Adjustment == adjustment), , drop = FALSE]
+      
+      cols <- colnames(tab)[grepl("floatedlnHR_", colnames(tab))]
+      cats <- sub("floatedlnHR_", "", cols)
+        
+      fp_frame <-
+        data.frame(
+          "exposure" = rep(exposure_title, length(cats)),
+          "variable" = cats,
+          "estimate" = rep(NA, length(cats)),
+          "stderr" = rep(NA, length(cats)),
+          "n" = rep(NA, length(cats)),
+          "n_event" = rep(NA, length(cats))
+        )
+      for (cat in cats){
+        fp_frame[fp_frame$variable == cat, c("estimate", "stderr", "n", "n_event", "mean_steps")] <- rel_tab[, as.vector(outer(
+            c(
+              "floatedlnHR",
+              "floatedSE",
+              "n", 
+              "n_event", 
+              "mean_steps"
+            ),
+            cat,
+            paste,
+            sep = "_"
+          ))]
+      }
+      fp_frame$nlab <- format_thousand(fp_frame$n_event)
+      fp_frame$estlab <- round_2_dp(exp(fp_frame$estimate)) 
+      assign(paste0("fp_frame_", exposure, "_", outcome), fp_frame)
+  }
+  
+
+  } 
+   
+   ## Set up for shape plots -------------------------------------------------------------------------------
+
+  ### Manual --------------------------------------------------------------------------------------------
+  # Allows fine-grained control over plot appearance
+  rat_val <- 1.5
+  size_val <- 14
+  line_val <- 0.7
+  textsize <- 4
+  ext <- c(0, 0)
+  lim_rad_scale <- 1/min(fp_frame_step_fifths_ind_death$stderr) + 1
+  breaks <- c(0.25, 0.5, 1, 2)
+
+    ylims <- c(min(breaks)-0.02, max(breaks)+0.01)
+  xlims <- c(0, quantile(dat$med_steps, 0.99))
+
+  ruglinewidth <- 0.008
+  datatoplot <- fp_frame_step_fifths_ind_death
+  
+  # Create the plot with main aesthetics
+shapeplot1 <- ggplot(datatoplot, aes(x = `mean_steps`, y = exp(estimate))) +
+
+  # Plot the point estimates
+  geom_point(aes(size = 1/stderr),
+             shape = 15,
+             colour = "black",
+             fill = "black",
+             stroke = 0.5) +
+  
+  # Plot point estimates text
+  geom_text(aes(y = exp(estimate+1.96*stderr),
+                label = estlab),
+            vjust = -0.8,
+            size  = textsize,
+            colour = "black") +
+  
+  # Plot n events text
+  geom_text(aes(y = exp(estimate-1.96*stderr),
+                label = nlab),
+            vjust = 1.8,
+            size  = textsize,
+            colour = "black") +
+  
+  # Plot the CIs
+  geom_linerange(aes(ymin = exp(estimate-1.96*stderr),
+                     ymax = exp(estimate+1.96*stderr)),
+                 colour = "black",
+                 linewidth = 0.5) +
+  
+  # Set the scale for the size of boxes
+  scale_radius(guide  = "none",
+               limits = c(0, lim_rad_scale),
+               range  = c(0, 5)) +
+  
+  # Use identity for aesthetic scales
+  scale_shape_identity() +
+  scale_colour_identity() +
+  scale_fill_identity() +
+  
+  # Set the y-axis scale
+  scale_y_continuous(trans  = "log",
+                     breaks = breaks) +
+  scale_x_continuous(labels = function(x) {format_thousand(x)}) + 
+  
+  # Add titles
+  xlab(" ") +
+  ylab("HR for All-Cause Mortality") + 
+
+ # Add rug plot
+  geom_rug(data = dat[dat$med_steps < quantile(dat$med_steps, 0.99), ], mapping = aes(x = med_steps), inherit.aes = FALSE, linewidth = ruglinewidth, alpha = 0.5)
+  
+# Plot like a CKB plot
+shapeplot1 <- ckbplotr::plot_like_ckb(plot = shapeplot1, 
+                        xlims          = xlims,
+                        ylims          = ylims,
+                        gap            = c(0.025, 0.025),
+                        ext            = ext,
+                        ratio          = rat_val,
+                        base_size      = size_val,
+                        base_line_size = line_val,
+                        colour         = "black") 
+
+# Second plot ---
+datatoplot <- fp_frame_step_fifths_ind_cv_death
+
+# Create the plot with main aesthetics
+shapeplot2 <- ggplot(datatoplot, aes(x = `mean_steps`, y = exp(estimate))) +
+
+  # Plot the point estimates
+  geom_point(aes(size = 1/stderr),
+             shape = 15,
+             colour = "black",
+             fill = "black",
+             stroke = 0.5) +
+  
+  # Plot point estimates text
+  geom_text(aes(y = exp(estimate+1.96*stderr),
+                  label = estlab),
+            vjust = -0.8,
+            size  = textsize,
+            colour = "black") +
+  
+  # Plot n events text
+  geom_text(aes(y = exp(estimate-1.96*stderr),
+                label = nlab),
+            vjust = 1.8,
+            size  = textsize,
+            colour = "black") +
+  
+  # Plot the CIs
+  geom_linerange(aes(ymin = exp(estimate-1.96*stderr),
+                     ymax = exp(estimate+1.96*stderr)),
+                 colour = "black",
+                 linewidth = 0.5) +
+  
+  # Set the scale for the size of boxes
+  scale_radius(guide  = "none",
+               limits = c(0, lim_rad_scale), # hard code limits because want to have same on different graphs
+               range  = c(0, 5)) +
+  
+  # Use identity for aesthetic scales
+  scale_shape_identity() +
+  scale_colour_identity() +
+  scale_fill_identity() +
+  
+  # Set the y-axis scale
+  scale_y_continuous(trans  = "log",
+                     breaks = breaks) +
+  scale_x_continuous(labels = function(x) {format_thousand(x)}) + 
+  
+  # Add titles
+  xlab(" ") +
+  ylab("HR for Cardiovascular Mortality") + 
+  
+  # Add rug plot
+  geom_rug(data = dat[dat$med_steps < quantile(dat$med_steps, 0.99), ], mapping = aes(x = med_steps), inherit.aes = FALSE, linewidth = ruglinewidth, alpha = 0.5)
+  
+# Plot like a CKB plot
+shapeplot2 <- ckbplotr::plot_like_ckb(plot = shapeplot2,
+                        xlims          = xlims,
+                        ylims          = ylims,
+                        gap            = c(0.025, 0.025),
+                        ext            = ext,
+                        ratio          = rat_val,
+                        base_size      = size_val,
+                        base_line_size = line_val,
+                        colour         = "black")
+  
+  
+  svg(paste0("outputs/shapeplot_stepfifths_", gsub(",", "_", adjustment), Sys.Date(), ".svg"), width = 10, height = 6)
+  gridExtra::grid.arrange(grobs = list(shapeplot1, shapeplot2), layout_matrix = cbind(1, 2), padding = unit(0.1, "line"))
+  dev.off()
+  
+  assign(paste0("shapeplot_ind_death_step_fifths_", gsub(",", "_", adjustment)), shapeplot1)
+  assign(paste0("shapeplot_ind_cv_death_step_fifths_", gsub(",", "_", adjustment)), shapeplot2)
+   }
+```
+
+
+# Spline plots
+
+```{r}
+outcomes <- c("ind_death", "ind_cv_death")
+
+# All the set up of steps terms which can be done ahead of time ==============================
+steps <- seq(quantile(dat$med_steps, 0.01), quantile(dat$med_steps, 0.99), length = 100)
+spl <- pspline(dat$med_steps, df=3)
+fifth1 <- quantile(dat$med_steps, 0.2)
+step_ref <-  mean(dat$med_steps[dat$med_steps < fifth1]) #5893.459 use mean steps in lowest category so match 
+spl_ref <- predict(spl, step_ref) # spline terms at reference value of variable
+spl_all <- predict(spl, steps) # spline terms across steps
+L <- t(spl_all) - c(spl_ref) # matrix of spline terms, centred for reference value of variable
+
+# Loop to produce plots =====================================================================
+for (outcome in outcomes){
+  if (outcome == "ind_death") {
+        outcome_title <- "HR for All-Cause Mortality"
+      }  else if (outcome == "ind_cv_death") {
+        outcome_title <- "HR for Cardiovascular Mortality"
+      }  else {
+        print(outcome)
+        stop("Unrecognised outcome value")
+      }
+  
+  # MODEL ===============================================================================
+  form <- as.formula(paste0("Surv(age_entry_days, age_exit_days, ", outcome, ") ~ pspline(med_steps, df = 3) + sex + ethnicity + tdi_quarters + qualif + smoking + alcohol + processed_meat + fresh_fruit + oily_fish + added_salt"))
+  model <- coxph(form, data = dat)
+  
+
+  # MANUALLY CALCULATING SPLINE TERMS SO CAN SELECT REFERENCE ==========================
+  step_terms <- names(model$coef)[grepl("med_steps", names(model$coef))]
+  b <- model$coef[step_terms] ## coefficients for spline terms (the first ten terms in the model if specified as above)
+  lnhr <- c(t(L) %*% b) # TO DO CHECK SAME AS PREDICTED
+  varb <- vcov(model)[step_terms, step_terms] ## covariance matrix of spline coefficients
+  varLb <- t(L) %*% varb %*% L
+  SELb <- sqrt(diag(varLb))
+  plot_dat <- data.frame(
+    "med_steps" = steps,
+    "lnhr" = lnhr,
+    "se" = SELb,
+    "hr" = exp(lnhr),
+    "lowerCI" = exp(lnhr - 1.96 * SELb),
+    "upperCI" = exp(lnhr + 1.96 * SELb)
+  )
+  
+  plot_spline <- ggplot(plot_dat, aes(x = steps, y = hr))+
+    geom_ribbon(aes(ymin = lowerCI,
+                   ymax = upperCI),
+              fill = "grey80")+
+    geom_line(color = "black")+
+    scale_y_continuous(trans  = "log",
+                     breaks = breaks) +
+  labs(y = outcome_title,
+       x = " ")+
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  geom_rug(data = dat[dat$med_steps < quantile(dat$med_steps, 0.99), ], mapping = aes(x = med_steps), inherit.aes = FALSE, linewidth = ruglinewidth, alpha = 0.5)
+  
+  plot_scaled_to_match <- ckbplotr::plot_like_ckb(plot = plot_spline,
+                        xlims          = xlims,
+                        ylims          = ylims,
+                        gap            = c(0.025, 0.025),
+                        ext            = ext,
+                        ratio          = rat_val,
+                        base_size      = size_val,
+                        base_line_size = line_val,
+                        colour         = "black")
+
+  assign(paste0("spline_plot_",outcome), plot_scaled_to_match)
+  
+  plot_hist <- ggplot(dat[dat$med_steps < quantile(dat$med_steps, 0.99), ], aes(x = med_steps)) + 
+    geom_histogram() + labs(y = "Count", x = "Daily Step Count")
+  
+  plot_hist_scaled_to_match <- ckbplotr::plot_like_ckb(plot = plot_hist,
+                        xlims          = xlims,
+                        gap            = c(0.025, 0.025),
+                        ext            = ext,
+                        ratio          = rat_val,
+                        base_size      = size_val,
+                        base_line_size = line_val,
+                        colour         = "black")
+
+  assign(paste0("hist_plot_",outcome), plot_hist_scaled_to_match)
+}
+```
+
+# Combine shape plot and spline plots
+
+```{r}
+svg(paste0("outputs/multiplot_plain_stepfifths.svg"), width = 30, height = 15)
+gridExtra::grid.arrange(grobs = list(shapeplot_ind_death_step_fifths_sex_ethnicity_tdi_quarters_qualif_smoking_alcohol_processed_meat_fresh_fruit_oily_fish_added_salt, shapeplot_ind_cv_death_step_fifths_sex_ethnicity_tdi_quarters_qualif_smoking_alcohol_processed_meat_fresh_fruit_oily_fish_added_salt, spline_plot_ind_death, spline_plot_ind_cv_death), layout_matrix = rbind(c(1, 2), c(3, 4)), widths = c(rep(2, 4), rep(2/3, 2)), padding = unit(0.1, "line"))
+dev.off()
+
+svg(paste0("outputs/multiplot_stepfifths.svg"), width = 25, height = 15)
+gridExtra::grid.arrange(grobs = list(shapeplot_ind_death_step_fifths_sex_ethnicity_tdi_quarters_qualif_smoking_alcohol_processed_meat_fresh_fruit_oily_fish_added_salt, shapeplot_ind_cv_death_step_fifths_sex_ethnicity_tdi_quarters_qualif_smoking_alcohol_processed_meat_fresh_fruit_oily_fish_added_salt, spline_plot_ind_death, spline_plot_ind_cv_death, hist_plot_ind_death, hist_plot_ind_cv_death), layout_matrix = rbind(c(1, 2), c(3, 4), c(5, 6)), widths = c(rep(2, 4), rep(2/3, 2)), padding = unit(0.1, "line"))
+dev.off()
+```
+
+# Box plots 
+Additional supplementary plots:
+```{r}
+p_age_sex <- ggplot(dat, aes(x = age_gp_crude, y = med_steps, fill = sex)) + 
+  geom_boxplot(outlier.shape = NA)+
+  
+  # scales and canvas
+  scale_y_continuous(breaks = c(0,4000,8000,12000,16000,20000,24000))+
+  coord_cartesian(ylim = c(0,24000))+
+  
+  # labels and guides
+  labs(y = "Daily Steps", x = "") + 
+  guides(fill=guide_legend(title="Sex"))+
+
+  # theme
+  theme_classic() # switch to ckb theme
+  
+svg(paste0("outputs/boxplot_agesex_", Sys.Date(), ".svg"), width = 10, height = 10)
+p_age_sex
+dev.off()
+
+
+
+
+dat_pace_box <- dat[dat$sr_usual_walking_pace %in% c("Slow pace", "Steady average pace", "Brisk pace"),] # restrict to only those people with data (note this means total for plot slightly lower than elsewhere)
+dat_pace_box$sr_usual_walking_pace <- factor(dat_pace_box$sr_usual_walking_pace, levels = c("Slow pace", "Steady average pace", "Brisk pace"))
+
+
+p_pace <- ggplot(dat_pace_box, aes(x = sr_usual_walking_pace, y = mean_one_minute_cadence, fill = sex)) + 
+  geom_boxplot(outlier.shape = NA)+
+  
+  # scales and canvas
+  scale_y_continuous(breaks = seq(0, 160, by = 10))+
+  coord_cartesian(ylim = c(70,150))+
+  
+  # labels and guides
+  labs(y = "Peak One-Minute Cadence (Steps/Minute)", x = "Self-Reported Usual Walking Pace") +
+  guides(fill=guide_legend(title="Sex"))+
+  
+  # theme
+  # theme_ckb()
+  theme_classic()
+
+svg(paste0("outputs/boxplot_pace_", Sys.Date(), ".svg"), width = 8, height = 8)
+p_pace
+dev.off()
+
+rm(dat_pace_box, p_age_sex, p_pace)
+
+```
+
+
+# Emmeans plot
+
+Results:
+```{r}
+forest_plot_tab <- read.csv("outputs/forest_plot_tab.csv")
+```
+
+
+```{r}
+# forest_plot_tab$Quality[] <-
+forest_plot_tab <- forest_plot_tab[(!(grepl("No |Chronic Disease", forest_plot_tab$Quality)))|(forest_plot_tab$Quality == "No Chronic Disease"), ]
+forest_plot_tab$Quality <- factor(forest_plot_tab$Quality, levels = rev(c("Excellent self-rated overall health",
+                                                                  "Good self-rated overall health",
+                                                                  "Fair self-rated overall health",
+                                                                  "Poor self-rated overall health",
+                                                                  "No Chronic Disease", 
+                                                                  "Chronic Obstructive Pulmonary Disease",
+                                                                  "Chronic Renal Failure",
+                                                                  "Depressive Disorder",
+                                                                  "Insulin Dependent Diabetes"
+)))
+forest_plot_tab$Colour <- ifelse(grepl("overall health", forest_plot_tab$Quality), "sr", "other")
+forest_plot_tab$Colour[forest_plot_tab$Quality == "No Chronic Disease"] <- "overall_no_cd"
+
+# Create forest plot
+plot_forest <- ggplot(data = forest_plot_tab, mapping = aes(color = Colour, x = Mean, y = Quality, xmin = LowerCI, xmax = UpperCI))+
+  geom_pointrange(size = 0.5, shape = 15)+
+  
+  # SCALES
+  scale_x_continuous(limits = c(6500, 11000),breaks = seq(3000,14000, by = 1000), name = "Adjusted Mean Daily Step Count")+
+  ylab("")+
+  
+  # THEMES =---------
+  # theme_ckb() +
+  theme_classic()+
+  theme(legend.position="none")
+
+svg(paste0("outputs/forestplot_emmeans_", Sys.Date(), ".svg"), width = 6, height = 6)
+plot_forest
+dev.off()
+```
+
+# Correlation Plot
+
+```{r}
+install.packages("corrplot")
+library(corrplot)
+
+dat_ukb_returns <- fread("/mnt/project/shared_data/data_clean/ukb_acc_return.csv", data.table = FALSE)
+
+cor_data <- dat_ukb_returns %>%
+  select(`acc-overall-avg`, `light-overall-avg`, `sleep-overall-avg`, `moderate-vigorous-overall-avg`,`sedentary-overall-avg`, eid) %>%
+  right_join(dat, by = "eid")
+
+
+cor_plot_data <- cor_data %>%
+  select(`acc-overall-avg`, `light-overall-avg`, `sleep-overall-avg`, `moderate-vigorous-overall-avg`, `sedentary-overall-avg`, med_steps,mean_one_minute_cadence)
+
+names(cor_plot_data) <- c("Acceleration", "Light Activity", "Sleep", "MVPA", "Sedentary", " Daily Steps", "Peak Cadence")
+
+cor_plot_data_correlations <- cor(cor_plot_data, method = "spearman", use="complete.obs")
+
+corrplot(cor_plot_data_correlations, method = "color", type = "upper", diag = F, order = "alphabet", addCoef.col = "black",tl.col="black", tl.srt=45)
+
+plot1 <- corrplot(cor_plot_data_correlations, method = "color", type = "upper", diag = F, order = "alphabet", addCoef.col = "black",tl.col="black", tl.srt=45)
+
+svg("outputs/correlation_plot.svg", width = 10, height = 10)
+print(plot1)
+dev.off()
+```
+

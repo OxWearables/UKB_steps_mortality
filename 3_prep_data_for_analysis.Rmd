@@ -1,0 +1,814 @@
+---
+title: "3_prep_data_for_analysis"
+format: html
+editor: visual
+---
+
+## Continue environment setup
+
+## Load packages
+
+Load packages for use in subsequent scripts:
+
+```{r}
+library(data.table)
+library(plyr)
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(readr)
+library(survival)
+library(Epi)
+library(emmeans)
+library(ggplot2)
+library(ckbplotr)
+```
+
+## Set-up useful functions
+
+```{r}
+source("useful_functions/rounding_functions.R")
+source("useful_functions/cut_by_quantile.R")
+```
+
+## Create necessary folders
+
+```{r}
+dir.create("data")
+dir.create("outputs")
+```
+
+## Load data
+
+```{r}
+dat_orig <- fread("/path/to/ukb/data/", data.table = FALSE) 
+dat_hes <- fread("/path/to/ukb/hes/data/", data.table = FALSE)
+dat_death <- fread("/path/to/ukb/death/data/", data.table = FALSE)
+dat_death_cause <- fread("path/to/ukb/death/cause/data", data.table = FALSE)
+dat_acc <- fread("/path/to/ukb/stepcount/data", data.table = FALSE)
+```
+
+Manipulate data:
+
+```{r}
+cols_dat <-
+  c(
+    "eid",
+    "sex",
+    "year_birth",
+    "month_birth",
+    "ethnicity_raw",
+    "ukb_assess_cent",
+    "date_baseline",
+    "date_lost_followup",
+    "tdi_raw",
+    "qualif_raw",
+    "alcohol_raw",
+    "smoking_raw",
+    "Fresh fruit intake | Instance 0", 
+    "Processed meat intake | Instance 0", 
+    "Oily fish intake | Instance 0",
+    "Salt added to food | Instance 0", 
+    "Overall health rating | Instance 0",
+    "Usual walking pace | Instance 0",
+    "BMI_raw",
+    "date_end_accel",
+    "quality_good_wear_time",
+    "Wear duration overall",
+    "quality_good_calibration",
+    "clips_before_cal",
+    "clips_after_cal",
+    "total_reads",
+    "overall_activity"
+  )
+cols_dat_hes <- c(
+  "eid",
+  "dnx_hesin_id",
+  "dnx_hesin_diag_id",
+  "dateepiimp",
+  "ins_index",
+  "arr_index",
+  "level",
+  "diag_icd9",
+  "diag_icd9_nb",
+  "diag_icd10",
+  "diag_icd10_nb"
+)
+dat <- dat_orig[, cols_dat]
+dat_hes <- dat_hes[, cols_dat_hes]
+```
+
+We inspect the data structure to check all columns are the types we expect:
+
+```{r}
+for (data in list(dat, dat_hes, dat_death, dat_death_cause)){
+    str(data, vec.len = 0) # vec.len = 0 avoids accidentally printing data
+}
+```
+
+We also do some simple formatting of date columns:
+
+```{r}
+# Tabular participant data
+dat$date_lost_followup <- as.Date(dat$date_lost_followup, format = "%Y-%m-%d")
+dat$date_end_accel <- as.Date(dat$date_end_accel, format = "%Y-%m-%d")
+dat$date_baseline <- as.Date(dat$date_baseline, format = "%Y-%m-%d") 
+
+# Hospital data
+dat_hes$date_hes <- as.Date(dat_hes$dateepiimp, format = "%Y-%m-%d")
+
+# Death data
+dat_death$date_death <-
+  as.Date(dat_death$date_of_death, format = "%Y-%m-%d")
+# A very small number of participants have duplicate records in death data (e.g. perhaps from a second death certificate after post-mortem)
+# In this dataset we keep just one record per participant: they should have the same date, and we will use the death_cause dataset for any 
+# other records related to death. It also only affects a very small number of participants.
+dat_death <-
+  dat_death[dat_death$ins_index == 0, ]
+```
+
+## Hospital record data
+
+We will use the hospital record data to identify prior disease (cardiovascular disease, cancer).
+
+We only use level 1 codes associated with the admission (primary diagnoses) to avoid being too sensitive to incidental codes (e.g. hypertension while in hospital with something unrelated)
+
+Processing prior primary CVD:
+
+```{r}
+# The lists of ICD codes we will consider------------------
+icd10_codes <- "I" # All I codes = all cardiovascular codes
+
+# Restrict the hospital data frame to occurrences of these codes with level == 1-------------------------------------------------
+dat_hes_rel <-
+  dat_hes[grepl(icd10_codes, dat_hes$diag_icd10) &
+          (dat_hes$level == 1),
+          c("eid", "date_hes", "diag_icd10")]
+
+# Find first occurrence----------------------------------------
+dat_hes_first_cvd <-
+  aggregate(dat_hes_rel$date_hes, list(dat_hes_rel$eid), min)
+colnames(dat_hes_first_cvd) <- c("eid", "date_hes_first_cvd")
+
+# Merge into main data frame-----------------------------------
+dat <- merge(
+  dat,
+  dat_hes_first_cvd,
+  by = "eid",
+  all.x = TRUE,
+  suffixes = c("", "dup") # This just means that if we accidentally run it twice we won't rename the columns (although running it more than twice still gets weird)
+)
+```
+
+We now add indicator variables for primary CVD and whether it was prevalent (before accelerometer wear):
+
+```{r}
+# Add indicators of any primary cvd and prevalent primary CVD
+dat$ind_hes_cvd <- !is.na(dat$date_hes_first_cvd)
+dat$ind_prev_hes_cvd <- dat$ind_hes_cvd & (dat$date_hes_first_cvd <= dat$date_end_accel)
+```
+
+Processing prior primary cancer:
+
+```{r}
+# The lists of ICD codes we will consider------------------
+icd10_codes <- "C"
+
+# Restrict the hospital data frame to occurrences of these codes with level == 1-------------------------------------------------
+dat_hes_rel <-
+  dat_hes[grepl(icd10_codes, dat_hes$diag_icd10) &
+            (dat_hes$level == 1),
+          c("eid", "date_hes", "diag_icd10")]
+
+# Find first occurrence----------------------------------------
+dat_hes_first_can <-
+  aggregate(dat_hes_rel$date_hes, list(dat_hes_rel$eid), min)
+colnames(dat_hes_first_can) <- c("eid", "date_hes_first_can")
+
+# Merge into main data frame-----------------------------------
+dat <- merge(
+  dat,
+  dat_hes_first_can,
+  by = "eid",
+  all.x = TRUE,
+  suffixes = c("", "dup") # This just means that if we accidentally run it twice we won't rename the columns
+)
+```
+
+We now add indicator variables for primary cancer and whether it was prevalent (before accelerometer wear):
+
+```{r}
+# Add indicators of any primary cancer and prevalent primary cancer
+dat$ind_hes_can <- !is.na(dat$date_hes_first_can)
+dat$ind_prev_hes_can <- dat$ind_hes_can & (dat$date_hes_first_can <= dat$date_end_accel)
+```
+
+## Variables
+
+### Age
+
+Age at accelerometer wear:
+
+```{r}
+# Add date of birth
+dat$approx_dob <-
+  as.Date(paste(dat$year_birth, dat$month_birth, "15", sep = "-"),
+          "%Y-%B-%d") # UK Biobank doesn't contain day of birth as it would be unnecessary identifying information, so we roughly impute it as the 15th of the birth month.
+
+# Add age at entry in days
+dat$age_entry_days <-
+  difftime(dat$date_end_accel,
+           dat$approx_dob,
+           units = "days")
+
+# Convert to age at entry in years
+dat$age_entry_years <- as.double(dat$age_entry_days)/365.25
+```
+
+### Sex
+
+Male, female
+
+### Age
+
+40-44 \[note this is really 43-44\]; 45-49; 75-79
+
+```{r}
+# Add age groups
+dat$age_gp <-
+  cut(
+    dat$age_entry_years,
+    breaks = c(40, 45, 50, 55, 60, 65, 70, 75, 80),
+    right = FALSE
+  )
+```
+
+### Ethnicity
+
+White, non-white
+
+```{r}
+# Ethnicity
+dat$ethnicity <-
+  plyr::revalue(
+    dat$ethnicity_raw,
+    c(
+      "British" = "White",
+      "Any other white background" = "White",
+      "Irish" = "White",
+      "White and Asian" = "Nonwhite",
+      "Caribbean" = "Nonwhite",
+      "Chinese"   = "Nonwhite",
+      "Pakistani"  = "Nonwhite",
+      "White and Black African" = "Nonwhite",
+      "Other ethnic group"  = "Nonwhite",
+      "Any other mixed background" = "Nonwhite",
+      "African"    = "Nonwhite",
+      "White and Black Caribbean" = "Nonwhite",
+      "Prefer not to answer" = NA,
+      "Indian"  = "Nonwhite",
+      "White" = "White",
+      "Do not know" = NA,
+      "Any other Black background" = "Nonwhite",
+      "Any other Asian background"  = "Nonwhite",
+      "Bangladeshi"  = "Nonwhite",
+      "Mixed"  = "Nonwhite",
+      "Asian or Asian British"  = "Nonwhite",
+      "Black or Black British"  = "Nonwhite"
+    )
+  )
+```
+
+### BMI
+
+```{r}
+# BMI
+dat$BMI <- dat$BMI_raw
+```
+
+### Education
+
+School leaver, further education, higher education
+
+```{r}
+dat$qualif <- NA
+dat$qualif[grepl("degree", dat$qualif_raw)] <-
+  "Higher education"
+dat$qualif[is.na(dat$qualif) & grepl("A level|NVQ|professional", dat$qualif_raw)] <- "Further education"
+dat$qualif[is.na(dat$qualif) & grepl("GCSEs|CSEs|None", dat$qualif_raw)] <- "School leaver"
+```
+
+### Smoking status
+
+Never, Former, Current
+
+```{r}
+# Smoking
+dat$smoking <-
+  plyr::revalue(dat$smoking_raw, replace = c("Prefer not to answer" = NA))
+```
+
+### Alcohol consumption
+
+```{r}
+# Alcohol
+dat$alcohol <-
+  plyr::revalue(
+    dat$alcohol_raw,
+    replace = c(
+      "Prefer not to answer" = NA,
+      "Three or four times a week" = "3+ times/week",
+      "Special occasions only" = "<3 times/week",
+      "One to three times a month" = "<3 times/week",
+      "Daily or almost daily" = "3+ times/week",
+      "Once or twice a week" = "<3 times/week"
+    )
+  )
+```
+
+### TDI
+
+By quarter in population
+
+### Fresh fruit
+
+```{r}
+dat$fresh_fruit_numeric <-
+  plyr::revalue(
+    dat$`Fresh fruit intake | Instance 0`,
+    replace = c(
+      "Less than one" = "0.5",
+      "Do not know" = NA,
+      "Prefer not to answer" = NA
+    )
+  )
+dat$fresh_fruit <-
+  cut(as.double(dat$fresh_fruit_numeric),
+      c(0, 1.999, 2.999, 3.999, 100000),
+      right = FALSE)
+```
+
+### Processed meat
+
+```{r}
+dat$processed_meat <-
+  plyr::revalue(
+    dat$`Processed meat intake | Instance 0`,
+    replace = c(
+      "Do not know" = NA,
+      "Prefer not to answer" = NA,
+      "Less than once a week" = "Less than twice a week",
+      "Once a week" = "Less than twice a week",
+      "5-6 times a week" = "5 or more times a week",
+      "Once or more daily" = "5 or more times a week"
+    )
+  )
+```
+
+### Oily fish
+
+```{r}
+dat$oily_fish <- plyr::revalue(
+  dat$`Oily fish intake | Instance 0`,
+  replace = c(
+    "Do not know" = NA,
+    "Prefer not to answer" = NA,
+    "Less than once a week" = "Less than twice a week",
+    "Once a week" = "Less than twice a week",
+    "5-6 times a week" = "5 or more times a week",
+    "Once or more daily" = "5 or more times a week"
+  )
+) 
+```
+
+### Salt added to food
+
+```{r}
+dat$added_salt <-
+  plyr::revalue(
+    dat$`Salt added to food | Instance 0`,
+    replace = c("Do not know" = NA, "Prefer not to answer" = NA)
+  )
+```
+
+### Self reported usual walking pace
+
+Slow, Steady, Brisk
+
+```{r}
+dat$sr_usual_walking_pace <-
+  plyr::revalue(dat$`Usual walking pace | Instance 0`, replace = c("Prefer not to answer" = "Missing"))
+dat$sr_usual_walking_pace[dat$sr_usual_walking_pace == ""| is.na(dat$sr_usual_walking_pace)] <- "Missing"
+```
+
+### Self-Reported overall health
+
+Excellent, good, fair, poor
+
+```{r}
+dat$sr_overall_health <-
+  plyr::revalue(
+    dat$`Overall health rating | Instance 0`,
+    replace = c(
+      "Prefer not to answer" = "Missing",
+      "Do not know" = "Missing",
+      "Excellent" = "Excellent self-rated overall health",
+      "Good" = "Good self-rated overall health",
+      "Fair" = "Fair self-rated overall health",
+      "Poor" = "Poor self-rated overall health"
+    )
+  )
+dat$sr_overall_health[dat$sr_overall_health == "" |
+                        is.na(dat$sr_overall_health)] <- "Missing"
+```
+
+### Wear season
+
+Spring, Summer, Autumn, Winter
+
+```{r}
+dat$month_wear <- month(dat$date_end_accel)
+dat$season_wear <- plyr::mapvalues(dat$month_wear,
+                                   c(12, 1:11),
+                                   c(
+                                     rep("Winter", 3),
+                                     rep("Spring", 3),
+                                     rep("Summer", 3),
+                                     rep("Autumn", 3)
+                                   ))
+table(dat$month_wear, dat$season_wear) # showing Dec-Feb assigned to winter (based on end time of accelerometer wear) and so on
+```
+
+### Charlson Comorbidity Index
+
+Definition based on: https://digital.nhs.uk/data-and-information/publications/statistical/shmi/2023-02
+
+```{r}
+# SUBSET DATA TO THE 5Y PRIOR TO ACC WEAR ================================================================
+dat_hes_w_acc <- merge(dat_hes, dat[, c("eid", "date_end_accel")], all.x = TRUE)
+dat_hes_w_acc$time_rel_to_acc <- difftime(dat_hes_w_acc$date_hes, dat_hes_w_acc$date_end_accel, units = "days")
+dat_hes_5y_lookback <- dat_hes_w_acc[(dat_hes_w_acc$time_rel_to_acc < 0) & (dat_hes_w_acc$time_rel_to_acc > -365.25*5), ]
+
+# SET UP LIST WITH CHARLSON SCORE INFO ===================================================================
+source("useful_functions/load_charlson_codelist.R") # Look at this folder to see the codelist
+
+# CHARLSON COMORBIDITY INDEX CALCULATION =====================================================================
+for (disease in names(charlson_codelist)){
+  # Prep
+  details <- charlson_codelist[[disease]]
+  string <- details[[1]]
+  weight <- details[[2]]
+
+  # Restrict to relevant ids
+  dat_hes_5y_lookback_current_code_ids <- unique(dat_hes_5y_lookback$eid[grepl(string, dat_hes_5y_lookback$diag_icd10)])
+  
+  # Record
+  dat[, paste0(disease, "_charlson")] <- ifelse(dat$eid %in% dat_hes_5y_lookback_current_code_ids, weight, 0)
+
+  # Spit out progress info
+  print(disease)
+  print(string)
+  print(table(dat[, paste0(disease, "_charlson") ]))
+  
+  # Tidy
+  rm(string, weight, details)
+}
+
+# Additional rules: 
+# Metastatic cancer means ignore cancer code
+dat$cancer_charlson[dat$metastatic_cancer_charlson > 0 ] <- 0
+
+# Total score
+dat$cci <- apply(dat[, paste0(names(charlson_codelist), "_charlson")] , 1, sum)
+
+# Truncate scores on [0-50]
+dat$cci[dat$cci < 0] <- 0 
+dat$cci[dat$cci > 50] <- 50
+```
+
+## Add various chronic disease indicators
+
+```{r}
+source("useful_functions/load_disease_codelist.R")
+dat_hes_pre_acc <- dat_hes_w_acc[dat_hes_w_acc$time_rel_to_acc < 0, ]
+
+for (disease in names(disease_codelist)){
+  # Extract lists------------------------------------
+  icd10_current <- disease_codelist[[disease]][[1]]
+  icd9_current <- disease_codelist[[disease]][[2]]
+  
+  # Filter dataset-----------------------------------
+  dat_current_disease_pre_acc <- dat_hes_pre_acc %>% dplyr::filter(diag_icd10 %in% icd10_current | diag_icd9 %in% icd9_current) # could change this to consistent syntax with rest but doesn't seem worth it! 
+  
+  # Add indicator to frame-----------------------------
+  dat[, paste0("prev_hes_", disease)] <- ifelse(dat$eid %in% dat_current_disease_pre_acc$eid, disease, paste0("No_", disease))
+  
+  # Tidy up-------------------------------------------
+  rm(icd10_current, icd9_current, dat_current_disease_pre_acc)
+}
+```
+
+## Add outcome
+
+-   Death: indicator for death during study period
+-   Indicator for that death being CVD
+
+Merge in death data:
+
+```{r}
+dat$ind_death_record <- dat$eid %in% dat_death$eid
+dat <-
+  merge(
+    dat,
+    dat_death[, c("eid", "date_death")],
+    by = "eid",
+    all.x = TRUE,
+    suffixes = c("", "dup") # This makes it safe if we accidentally run it twice - we won't rename the columns
+  )
+```
+
+Set up censoring dates:
+
+```{r}
+ind_wales <-
+  dat$ukb_assess_cent %in% c("Cardiff", "Wrexham", "Swansea")
+ind_scotland <- 
+  dat$ukb_assess_cent %in% c("Edinburgh", "Glasgow")
+
+dat$date_cens <- "2021-09-30"
+dat$date_cens[ind_scotland] <- "2021-10-31"
+dat$date_cens <- as.Date(dat$date_cens)
+```
+
+\[Note: if there is a new data release you can update these. But beware to:
+
+-   update the outcomes in our project - even if there's been a new release, they won't update in our project unless someone triggers it.
+-   rerun all dataset generation code, including the lower level script
+-   sense check the results: do they end in the expected month?
+-   check the censoring dates by region are correctly entered\]
+
+Participants with a recorded loss-to-follow-up date should be censored at loss-to-follow-up:
+
+```{r}
+# People who were lost to follow-up are censored at earliest of loss-to-follow-up and overall censoring
+dat$date_cens <- pmin(dat$date_cens, dat$date_lost_followup, na.rm = TRUE)
+
+# A few people are apparently lost to follow up in linked health records before they wore the accelerometer
+# We will exclude these people - see below
+```
+
+Participants who died should be censored at death, provided this occurred before the end of records:
+
+```{r}
+# People who died are followed up to earliest of date of death and overall censoring
+dat$date_fu <- dat$date_cens
+dat$date_fu[dat$ind_death_record] <- pmin(dat$date_cens[dat$ind_death_record], dat$date_death[dat$ind_death_record])
+```
+
+We now record the event status at exit. We don't use 'ind_death_record' directly there may be instances of people with an event in the data after censoring (NB a minor issue in this case, more of an issue when working with hospital data so this inherits from there).
+
+```{r}
+# Mark ind_death for people with a death record during study period
+dat$ind_death <- FALSE
+dat$ind_death[dat$ind_death_record & (dat$date_death == dat$date_fu)] <- TRUE
+
+# Mark ind_cv_death for participants with a CV death record in the study period
+# Note we are counting any appearance of a CV code on the death register as a CVD death
+# Even if this code is not the underlying (primary) cause of death
+ids_death_cvd <-
+  dat_death_cause$eid[grepl("I", dat_death_cause$cause_icd10)]
+ind_death_cvd_record <-  dat$eid %in% ids_death_cvd
+dat$ind_cv_death <- FALSE
+dat$ind_cv_death[ind_death_cvd_record &
+                 (dat$date_fu == dat$date_death)] <- TRUE
+```
+
+We calculate follow up time (i.e. total time on study):
+
+```{r}
+dat$fu_time <-
+  as.double(difftime(dat$date_fu, dat$date_end_accel, units = "days"))
+```
+
+Alternatively, we might want to analyse the data using age as the timescale, so we add a variable for age at exit in days:
+
+```{r}
+dat$age_exit_days <- as.double(dat$age_entry_days + dat$fu_time)
+dat$age_exit_days2 <-  as.double(difftime(dat$date_fu, dat$approx_dob, units = "days")) # calculation in an alternative way just so we can implement a logic check
+
+# Logic check
+if (!isTRUE(all.equal(dat$age_exit_days, dat$age_exit_days2))){
+    stop("Different methods of calculating age at exit give different answers")
+}
+```
+
+## Merge steps data
+
+So far we've just been working with the non-accelerometry data. We now fold in the steps data to the broader dataset.
+
+Merge:
+
+```{r}
+dat <- merge(dat, dat_acc, by = "eid", all.x = TRUE)
+dat$med_steps <- dat$steps_daily_median_ssl.imputed
+```
+
+Chop steps into categories:
+
+```{r}
+step_cat_bounds <- c(0, 5000, 7500, 10000, 12500, 15000, 100000000000)
+dat$step_cats <- cut(dat$med_steps, breaks = step_cat_bounds, right = FALSE) # Check this is correct boundarying
+```
+
+## Exclusions
+
+We will record how many participants are excluded at each of the steps (e.g. for a flow diagram):
+
+```{r}
+tab_exc <- data.frame("Exclusion" = "Starting cohort", "Number_excluded" = NA, "Number_remaining" = nrow(dat))
+```
+
+We do the accelerometer data quality exclusions:
+
+-   Exclude participants without step data:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[!is.na(dat$med_steps), ]
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "No step data",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+-   Exclude participants whose device could not be calibrated:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[dat$CalibrationOK == 1, ]
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "Poor calibration",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+-   Exclude participants for whom \>1% of values were clipped (fell outside the sensor's range) before or after calibration:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[(dat$clips_before_cal < 0.01*dat$total_reads) & (dat$clips_after_cal < 0.01*dat$total_reads) , ]
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "Too many clips",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+-   Exclude participants who had \<3 days wear or did not have wear in each hour of the 24 hour day:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[dat$quality.goodWearTime == 1, ] # Note that this has already been calculated in UKB, 
+# we don't need to manually calculate it: https://biobank.ndph.ox.ac.uk/showcase/field.cgi?id=90015
+# But we might actually use the values from the new data processing
+
+# 2023_01_12 - Now using quality.goodWearTime, which is calcualted from the new data processing
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "Poor wear time",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+-   Exclude participants with unrealistically high overall activity values:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[dat$overall_activity < 100, ] # Again can rework this with new data processing
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "Very high overall activity",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+We will also exclude people who had already had a primary cardiovascular disease event in hospital data at the time they wore the accelerometer:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[!(dat$ind_prev_hes_cvd), ]
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "Prevalent cardiovascular disease in hospital data",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+We will also exclude people who had already had a primary cancer event in hospital data at the time they wore the accelerometer:
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[!(dat$ind_prev_hes_can), ]
+tab_exc <-
+  rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = "Prevalent cancer in hospital data",
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+```
+
+Missing data in adjustment variables:
+
+```{r}
+for (
+  cov in c(
+    "age_entry_years",
+    "sex",
+    "BMI",
+    "ethnicity",
+    "tdi_raw",
+    "qualif",
+    "smoking",
+    "alcohol",
+    "fresh_fruit",
+    "processed_meat",
+    "oily_fish",
+    "added_salt", 
+    "sr_overall_health" # needed for emmeans analyses. XXXX note no longer needed if not doing emmeans analyses
+  )
+){
+  nb <- nrow(dat)
+  print(cov)
+  missing_cov <- is.na(dat[, cov])|(as.character(dat[, cov]) == "") |(as.character(dat[, cov]) == "Missing") # for safety coerce to character for second check as can return NA on some classes e.g. Date
+  dat <- dat[!missing_cov,]
+  tab_exc <- rbind(
+    tab_exc,
+    data.frame(
+      "Exclusion" = paste0("Missing ", cov),
+      "Number_excluded" = nb - nrow(dat),
+      "Number_remaining" = nrow(dat)
+    )
+  )
+}
+```
+
+Exclude people lost to follow up before accelerometer wear:
+
+(See note above)
+
+```{r}
+nb <- nrow(dat)
+dat <- dat[!(dat$date_cens < dat$date_end_accel), ]
+tab_exc <- rbind(
+  tab_exc,
+  data.frame(
+    "Exclusion" = "Lost to linked health record follow-up before accelerometer study entry",
+    "Number_excluded" = nb - nrow(dat),
+    "Number_remaining" = nrow(dat)
+  )
+)
+tab_exc
+```
+
+## Write out
+
+```{r}
+write.csv(dat, "data/prepped_steps.csv")
+```
+
+## Clear up some of the mess ahead of running future scripts
+
+Not strictly necessary but hopefully avoids accidentally relying on leftover data in later scripts.
+
+```{r}
+rm(list = setdiff(ls(), lsf.str())) # this setdiff is listing everything then listing only functions. So it's saying remove everything that's not a function (see https://stackoverflow.com/questions/8305754/remove-all-variables-except-functions) 
+```

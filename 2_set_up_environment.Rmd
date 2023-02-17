@@ -1,0 +1,25 @@
+---
+title: "2_set_up_environment"
+output: html_document
+---
+## Remember to open the R Project!!! ##
+## Install packages with renv
+
+Fiddly hack to make sure rlang is up to date: 
+```{r}
+install.packages("rlang") # Confirm that rlang is up to date.
+```
+
+Set up renv, the package manager for this project: 
+```{r}
+install.packages("renv")
+renv::activate()
+```
+
+Use renv to restore packages from the lockfile: 
+```{r}
+renv::restore(prompt = FALSE)
+.rs.restartR() # restart R after package update
+# This may take some time
+```
+
